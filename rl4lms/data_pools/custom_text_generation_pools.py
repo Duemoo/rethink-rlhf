@@ -10,7 +10,12 @@ import pandas
 from collections import defaultdict
 import zipfile
 import json
+import re
+import random
+from transformers import AutoTokenizer
+import spacy
 
+from typing import Callable, List
 
 class ToTTo(TextGenPool):
     @classmethod
@@ -580,6 +585,138 @@ class DailyDialog(TextGenPool):
 
         dp_instance = cls(samples)
         return dp_instance
+
+
+class LAMBADA(TextGenPool):
+    @classmethod
+    def prepare(cls, split: str) -> 'TextGenPool':
+        
+        split_name = 'validation' if split=='val' else split
+        ds = load_dataset("lambada", split=split_name)
+        samples = []
+        idx = 0
+
+        for ex in ds:
+
+            text = ex["text"]
+            
+            words = text.split(" ")
+            out = words[-1]
+            inp = " ".join(words[:-1]).strip() + " <extra_id_1>"
+
+            sample = Sample(id=f"{split}_{idx}",
+                           prompt_or_input_text=inp,
+                           references=[out]
+                           )
+            samples.append(sample)
+            idx += 1
+
+        pool_instance = cls(samples)
+        return pool_instance
+
+
+class HH_RLHF(TextGenPool):
+    @classmethod
+    def prepare(cls, split: str, fast_eval, toy_train, reduce_samples, seed=0) -> 'TextGenPool':
+        
+        # Use 10% of original test set data as a validation set
+        if split in ['val', 'test']:
+            ds_original = load_dataset("Anthropic/hh-rlhf", split='test').train_test_split(test_size=0.1, seed=seed)
+            if split == 'test':
+                ds = ds_original['train']
+            else:
+                ds = ds_original['test']
+
+        elif split == 'train':
+            ds = load_dataset("Anthropic/hh-rlhf", split='train')
+
+        samples = []
+        idx = 0
+
+        for ex in ds:
+
+            text = ex["chosen"]
+            out = text.split('Assistant: ')[-1]
+            inp = text[:-len(out)]
+            rejected = ex["rejected"].split('Assistant: ')[-1]
+
+            if len(rejected.strip())==0 or len(out.strip())==0:
+                continue
+
+            sample = Sample(id=f"{split}_{idx}",
+                        prompt_or_input_text=inp,
+                        references=[out],
+                        meta_data={
+                                "rejected": rejected
+                            }
+                        )
+            samples.append(sample)
+            idx += 1
+
+            if (split=='val' or split=='test'):
+                if fast_eval:
+                    if idx >=1000:
+                        break
+
+            if toy_train:
+                if idx >= 2:
+                    break
+
+            if split=='train' and reduce_samples:
+                if idx >= 50000:
+                    break
+
+        pool_instance = cls(samples)
+        return pool_instance
+
+
+class Alpaca(TextGenPool):
+    @classmethod
+    def prepare(cls, split: str, fast_eval, toy_train, reduce_samples, seed=0) -> 'TextGenPool':
+
+        ds_dict = load_dataset("yahma/alpaca-cleaned", split='train').train_test_split(test_size=0.1, seed=seed)
+        samples = []
+
+        if split == 'val':
+            split_names = ["test"]
+        elif split == 'test':
+            split_names = ["test"]
+        else:
+            split_names = ["train"]
+
+        for split_name in split_names:
+
+            ds = ds_dict[split_name]            
+            idx = 0
+
+            for ex in ds:
+
+                out = ex['output']
+                inp = "Instruction: " + ex["instruction"] + " Input: " + ex["input"] + " Answer: "
+
+                sample = Sample(id=f"{split}_{idx}",
+                            prompt_or_input_text=inp,
+                            references=[out],
+                            meta_data={
+                                    "split": split_name
+                                }
+                            )
+                samples.append(sample)
+                idx += 1
+
+                if (split=='val' or split=='test') and fast_eval:
+                    if idx >=1000:
+                        break
+
+                if toy_train:
+                    if idx >= 2:
+                        break
+                if split=='train' and reduce_samples:
+                    if idx >= 50000:
+                        break
+
+        pool_instance = cls(samples)
+        return pool_instance
 
 
 if __name__ == "__main__":

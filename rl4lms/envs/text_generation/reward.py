@@ -3,7 +3,7 @@ from abc import ABC, abstractclassmethod
 import torch
 from datasets import load_metric
 from rl4lms.envs.text_generation.observation import Observation
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForSeq2SeqLM, T5ForConditionalGeneration
 from rl4lms.envs.text_generation.metric import (
     CIDERMetric,
     MeteorMetric,
@@ -270,6 +270,122 @@ class BERTScoreRewardFunction(RewardFunction):
         return 0
 
 
+class DeBERTaRewardFunction(RewardFunction):
+    def __init__(
+        self, include_prompt_for_eval,
+    ) -> None:
+        super().__init__()
+        model_name = "OpenAssistant/reward-model-deberta-v3-large-v2"
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._metric_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._metric_tokenizer.truncation_side = "left"
+        self._max_length = 512
+        self._metric_model = AutoModelForSequenceClassification.from_pretrained(
+            model_name
+        ).to(self._device)
+        self._include_prompt_for_eval = include_prompt_for_eval
+
+    def __call__(
+        self,
+        current_observation: Observation,
+        action: int,
+        next_observation: Observation,
+        done: bool,
+        meta_info: Dict[str, Any] = None,
+    ) -> float:
+        if done:
+            generated_text = next_observation.context_text
+
+            with torch.no_grad():
+                if self._include_prompt_for_eval:
+                    encoded = self._metric_tokenizer(
+                        current_observation.prompt_or_input_text,
+                        generated_text,
+                        return_tensors="pt",
+                        truncation=True,
+                        padding="max_length",
+                        max_length=self._max_length
+                    )
+                else:
+                    encoded = self._metric_tokenizer(
+                        generated_text,
+                        return_tensors="pt",
+                        truncation=True,
+                        padding="max_length",
+                        max_length=self._max_length
+                    )
+                outputs = self._metric_model(
+                    input_ids=encoded.input_ids.to(self._device),
+                    attention_mask=encoded.attention_mask.to(self._device),
+                )
+                score = outputs.logits[0].item()
+                #print(f"\n\n\n\nscore: {score}\n\n\n")
+                #scores = torch.softmax(outputs.logits.flatten(), dim=0)
+                #score = scores[self._label_ix].item()
+                return score
+        return 0
+
+
+class FLANRewardFunction(RewardFunction):
+    def __init__(
+        self,
+        dataset,
+    ) -> None:
+        super().__init__()
+        model_name = 'stanfordnlp/SteamSHP-flan-t5-large'
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._metric_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._metric_tokenizer.truncation_side = "left"
+        self._max_length = 512
+        self._metric_model = T5ForConditionalGeneration.from_pretrained(model_name).to(self._device)
+        self._dataset_name = dataset
+
+    def __call__(
+        self,
+        current_observation: Observation,
+        action: int,
+        next_observation: Observation,
+        done: bool,
+        meta_info: Dict[str, Any] = None,
+    ) -> float:
+        if done:
+            generated_text = next_observation.context_text
+            if self._dataset_name == "shp":
+                post = meta_info['post']
+                input_text = f"POST: {post}\n\nRESPONSE A: {generated_text}\n\nRESPONSE B: .\n\nWhich response is better? RESPONSE" 
+
+            elif self._dataset_name == "hh_rlhf":
+                post = " ".join(current_observation.prompt_or_input_text.splitlines())
+                input_text = f"POST: {post}\n\nRESPONSE A: {generated_text}\n\nRESPONSE B: .\n\nWhich response is better? RESPONSE" 
+                #print(f"\n\ninput text: {input_text}\n\n")
+
+            elif self._dataset_name == "alpaca":
+                post = current_observation.prompt_or_input_text
+                input_text = f"POST: {post}\n\nRESPONSE A: {generated_text}\n\nRESPONSE B: .\n\nWhich response is better? RESPONSE" 
+
+            else:
+                raise NotImplementedError
+
+            with torch.no_grad():
+                encoded = self._metric_tokenizer(
+                    generated_text,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding="max_length",
+                    max_length=self._max_length
+                )
+                outputs = self._metric_model.generate(
+                    encoded.input_ids.to(self._device),
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    max_new_tokens=1
+                )
+                # index 71 corresponds to the token for 'A'
+                score = torch.exp(outputs.scores[0][:, 71]) / torch.exp(outputs.scores[0][:,:]).sum(axis=1)
+                return score.item()
+        return 0
+
+
 class BLEURewardFunction(RewardFunction):
     def __init__(self) -> None:
         super().__init__()
@@ -432,6 +548,238 @@ class SpiderRewardFunction(BatchedRewardFunction):
                 rewards[ind] = score + aux_score
 
         return rewards
+
+
+class SentenceT5RewardFunction(BatchedRewardFunction):
+    def __init__(self, model_size: str, max_length: int, num_pooling_layers: int, truncation_side: str, mode='pos', is_alpaca=False) -> None:
+        super().__init__()
+        model_name = 'sentence-transformers/sentence-t5-' + model_size
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self._device)
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._tokenizer.truncation_side = truncation_side
+        self._max_length = max_length
+        self._num_pooling_layers = num_pooling_layers
+        assert(mode in ['pos', 'neg', 'posneg'])
+        self._mode = mode
+        self._is_alpaca = is_alpaca
+
+    def __call__(
+        self,
+        prompt_texts: List[str],
+        gen_texts: List[str],
+        ref_texts: List[List[str]],
+        dones: List[bool],
+        meta_info: Dict[str, Any] = None,
+    ) -> List[float]:
+        prompts = []
+        gens = []
+        pos_refs = []
+        neg_refs = []
+        indices_with_done = []
+        rewards = torch.zeros(len(prompt_texts))
+        #print(f"\n\n\n\nmeta: {meta_info}\n\n\n\n")
+        for ix, (prompt, gen, ref, done, meta) in enumerate(
+            zip(prompt_texts, gen_texts, ref_texts, dones, meta_info)
+        ):
+            if done:
+                prompts.append(prompt)
+                gens.append(gen)
+                if self._mode == 'pos' or self._is_alpaca:
+                    pos_refs.append(ref[0])
+                elif self._mode == 'neg':
+                    neg_refs.append(meta['rejected'])
+                elif self._mode == 'posneg':
+                    pos_refs.append(ref[0])
+                    neg_refs.append(meta['rejected'])
+                else:
+                    raise NotImplementedError
+                indices_with_done.append(ix)
+
+        if len(indices_with_done) > 0:
+            if self._mode == 'pos' or self._is_alpaca:
+                pred_emb = self.get_embedding(gens)
+                ref_emb = self.get_embedding(pos_refs)
+                sim_scores = (pred_emb*ref_emb).sum(dim=-1)
+            elif self._mode == 'neg':
+                pred_emb = self.get_embedding(gens)
+                ref_emb = self.get_embedding(neg_refs)
+                sim_scores = 1 - (pred_emb*ref_emb).sum(dim=-1)
+            elif self._mode == 'posneg':
+                pred_emb = self.get_embedding(gens)
+                try:
+                    pos_ref_emb = self.get_embedding(pos_refs)
+                except:
+                    print(f"\n\n\npos_refs: {pos_refs}")
+                neg_ref_emb = self.get_embedding(neg_refs)
+                pos_sim_scores = (pred_emb*pos_ref_emb).sum(dim=-1)
+                neg_sim_scores = (pred_emb*neg_ref_emb).sum(dim=-1)
+                sim_scores = pos_sim_scores + (1 - neg_sim_scores)
+
+            for ind, sim_score in zip(indices_with_done, sim_scores):
+                rewards[ind] = sim_score
+
+        return rewards
+
+    def get_embedding(self, sentences):
+        #print(f"\n\n\n###########################sentences: \n\n{sentences}\n\n##############################")
+        tokenized = self._tokenizer.batch_encode_plus(
+            sentences,
+            padding="max_length",
+            max_length=self._max_length,
+            return_tensors="pt",
+            truncation=True,
+            )
+
+        with torch.no_grad():
+            input_ids = tokenized.input_ids.to(self._device)
+            attention_mask = tokenized.attention_mask.to(self._device)
+
+            encoder_outputs = self._model.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+            last_hidden_states = encoder_outputs["hidden_states"][-self._num_pooling_layers:]
+            if self._num_pooling_layers > 1:
+                last_hidden_states = torch.stack(last_hidden_states, dim=0).to(self.device) # shape: (n * bs * seq_length * hidden_dim)
+            else:
+                last_hidden_states = last_hidden_states[0].unsqueeze(0)
+
+            # Mean pooling on last n hidden layers, following: https://arxiv.org/abs/2108.08877
+            embedding = last_hidden_states.mean(dim=0).to(self._device) # shape: (bs * seq_length * hidden_dim)
+
+            # Mask out hidden states generated from pad tokens
+            attention_mask_unsqueezed = attention_mask.unsqueeze(-1) # shape: (bs * seq_length * 1)
+            embedding = embedding * attention_mask_unsqueezed
+
+            # Mean pooling
+            embedding = embedding.sum(dim=1) # shape: (bs * hidden_dim)
+            seq_lengths = attention_mask.sum(dim=-1)
+            embedding = embedding / seq_lengths.unsqueeze(-1)
+            
+            # Apply L2 norm
+            embedding = torch.nn.functional.normalize(embedding, p=2.0, dim=1)
+            
+        return embedding
+
+
+class SMLMSimRewardFunction(BatchedRewardFunction):
+    def __init__(self, model_name: str, max_length: int, num_pooling_layers: int, truncation_side: str, mode='pos', is_alpaca=False) -> None:
+        super().__init__()
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self._device)
+        for param in self._model.parameters():
+            param.requires_grad = False
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._tokenizer.truncation_side = truncation_side
+        self._max_length = max_length
+        self._num_pooling_layers = num_pooling_layers
+        assert(mode in ['pos', 'neg', 'posneg'])
+        self._mode = mode
+        self._is_alpaca = is_alpaca
+
+    def __call__(
+        self,
+        prompt_texts: List[str],
+        gen_texts: List[str],
+        ref_texts: List[List[str]],
+        dones: List[bool],
+        meta_info: Dict[str, Any] = None,
+    ) -> List[float]:
+        prompts = []
+        gens = []
+        pos_refs = []
+        neg_refs = []
+        indices_with_done = []
+        rewards = torch.zeros(len(prompt_texts))
+        for ix, (prompt, gen, ref, done, meta) in enumerate(
+            zip(prompt_texts, gen_texts, ref_texts, dones, meta_info)
+        ):
+            if done:
+                prompts.append(prompt)
+                gens.append(gen)
+                if self._mode == 'pos' or self._is_alpaca:
+                    pos_refs.append(ref[0])
+                elif self._mode == 'neg':
+                    neg_refs.append(meta['rejected'])
+                elif self._mode == 'posneg':
+                    pos_refs.append(ref[0])
+                    neg_refs.append(meta['rejected'])
+                else:
+                    raise NotImplementedError
+
+                indices_with_done.append(ix)
+                
+        if len(indices_with_done) > 0:
+            if self._mode == 'pos' or self._is_alpaca:
+                pred_emb = self.get_embedding(gens)
+                ref_emb = self.get_embedding(pos_refs)
+                sim_scores = (pred_emb*ref_emb).sum(dim=-1)
+            elif self._mode == 'neg':
+                pred_emb = self.get_embedding(gens)
+                ref_emb = self.get_embedding(neg_refs)
+                sim_scores = 1 - (pred_emb*ref_emb).sum(dim=-1)
+            elif self._mode == 'posneg':
+                pred_emb = self.get_embedding(gens)
+                pos_ref_emb = self.get_embedding(pos_refs)
+                neg_ref_emb = self.get_embedding(neg_refs)
+                pos_sim_scores = (pred_emb*pos_ref_emb).sum(dim=-1)
+                neg_sim_scores = (pred_emb*neg_ref_emb).sum(dim=-1)
+                sim_scores = pos_sim_scores + (1 - neg_sim_scores)
+            else:
+                raise NotImplementedError
+
+            for ind, sim_score in zip(indices_with_done, sim_scores):
+                rewards[ind] = sim_score
+
+        return rewards
+
+    def get_embedding(self, sentences):
+        #print(f"\n\n\n###########################sentences: \n\n{sentences}\n\n##############################")
+        tokenized = self._tokenizer.batch_encode_plus(
+            sentences,
+            padding="max_length",
+            max_length=self._max_length,
+            return_tensors="pt",
+            truncation=True,
+            )
+
+        with torch.no_grad():
+            input_ids = tokenized.input_ids.to(self._device)
+            attention_mask = tokenized.attention_mask.to(self._device)
+
+            encoder_outputs = self._model.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+            last_hidden_states = encoder_outputs["hidden_states"][-self._num_pooling_layers:]
+            if self._num_pooling_layers > 1:
+                last_hidden_states = torch.stack(last_hidden_states, dim=0).to(self._device) # shape: (n * bs * seq_length * hidden_dim)
+            else:
+                last_hidden_states = last_hidden_states[0].unsqueeze(0)
+
+            # Mean pooling on last n hidden layers, following: https://arxiv.org/abs/2108.08877
+            embedding = last_hidden_states.mean(dim=0).to(self._device) # shape: (bs * seq_length * hidden_dim)
+
+            # Mask out hidden states generated from pad tokens
+            attention_mask_unsqueezed = attention_mask.unsqueeze(-1) # shape: (bs * seq_length * 1)
+            embedding = embedding * attention_mask_unsqueezed
+
+            # Mean pooling
+            embedding = embedding.sum(dim=1) # shape: (bs * hidden_dim)
+            seq_lengths = attention_mask.sum(dim=-1)
+            embedding = embedding / seq_lengths.unsqueeze(-1)
+            
+            # Apply L2 norm
+            embedding = torch.nn.functional.normalize(embedding, p=2.0, dim=1)
+            
+        return embedding
 
 
 #############################################################################

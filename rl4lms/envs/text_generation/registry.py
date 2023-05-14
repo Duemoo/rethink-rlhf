@@ -20,6 +20,9 @@ from rl4lms.data_pools.custom_text_generation_pools import (
     WMT14PreprocessedEnDe,
     WMT16NewsOnlyDatasetEnDe,
     DailyDialog,
+    LAMBADA,
+    HH_RLHF,
+    Alpaca,
 )
 from rl4lms.data_pools.text_generation_pool import TextGenPool
 from rl4lms.envs.text_generation.alg_wrappers import wrap_onpolicy_alg
@@ -44,6 +47,10 @@ from rl4lms.envs.text_generation.metric import (
     TERMetric,
     chrFmetric,
     IntentAccuracyDailyDialog,
+    RepMetric,
+    MAUVEMetric,
+    VerbalizerMetric,
+    RLHFSimMetric,
 )
 from rl4lms.envs.text_generation.policy.base_policy import LMActorCriticPolicy
 from rl4lms.envs.text_generation.policy.causal_policy import (
@@ -74,6 +81,10 @@ from rl4lms.envs.text_generation.reward import (
     SpiderRewardFunction,
     chrF,
     IntentAccuracy,
+    DeBERTaRewardFunction,
+    FLANRewardFunction,
+    SentenceT5RewardFunction,
+    SMLMSimRewardFunction,
 )
 from rl4lms.envs.text_generation.preference_reward import CommonGenPrefRM
 from rl4lms.envs.text_generation.test_datapool import TestTextGenPool
@@ -99,10 +110,16 @@ class DataPoolRegistry:
         "iwslt2017en_de": IWSLT2017EnDe,
         "crd3": CRD3DialogueGeneration,
         "daily_dialog": DailyDialog,
+        "lambada": LAMBADA,
+        "hh_rlhf": HH_RLHF,
+        "alpaca": Alpaca,
     }
 
     @classmethod
     def get(cls, datapool_id: str, kwargs: Dict[str, Any]) -> TextGenPool:
+        #print(f"\n\n\nregistry: {cls._registry.items()}\n")
+        #print(f"datapool_Id: {datapool_id}\n")
+        #print(cls._registry['hh_rlhf'], '\n')
         datapool_cls = cls._registry[datapool_id]
         datapool = datapool_cls.prepare(**kwargs)
         return datapool
@@ -133,6 +150,10 @@ class RewardFunctionRegistry:
         "chrf": chrF,
         "intent_accuracy": IntentAccuracy,
         "common_gen_preference_model": CommonGenPrefRM,
+        "deberta_reward": DeBERTaRewardFunction,
+        "flan_reward": FLANRewardFunction,
+        "smlm_sim": SMLMSimRewardFunction,
+        "sentence_t5": SentenceT5RewardFunction,
     }
 
     @classmethod
@@ -169,6 +190,10 @@ class MetricRegistry:
         "ter": TERMetric,
         "chrf": chrFmetric,
         "intent_accuracy": IntentAccuracyDailyDialog,
+        "rlhf_sim": RLHFSimMetric,
+        "rep": RepMetric,
+        "mauve": MAUVEMetric,
+        "verbalizer": VerbalizerMetric, 
     }
 
     @classmethod

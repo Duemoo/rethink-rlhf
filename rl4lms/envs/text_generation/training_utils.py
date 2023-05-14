@@ -1,6 +1,7 @@
 from functools import partial
 from typing import Any, Dict, List
 import numpy as np
+from tqdm import tqdm
 
 from rl4lms.data_pools.text_generation_pool import Sample
 from rl4lms.envs.text_generation.env import TextGenEnv
@@ -36,6 +37,8 @@ def build_tokenizer(tokenizer_config: Dict[str, Any]):
         tokenizer_config["model_name"])
     if tokenizer.pad_token is None and tokenizer_config.get("pad_token_as_eos_token", True):
         tokenizer.pad_token = tokenizer.eos_token
+    #if tokenizer_config.get("is_llama", False):
+    #    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     tokenizer.padding_side = tokenizer_config.get(
         "padding_side", "left")
     tokenizer.truncation_side = tokenizer_config.get(
@@ -165,6 +168,8 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
                               self._env, self._tracker,
                               self._policy_state_dict,
                               self._alg_state_dict)
+        
+        #self._alg.policy.get_language_model().resize_token_embeddings(len(self._tokenizer))
 
         # extract train params
         self._max_episode_length = self._env_config["args"]["max_episode_length"]
@@ -197,7 +202,7 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
         self._evaluate_on_datapools(epoch=iter_start)
 
         # train for given number of iters
-        for epoch in range(iter_start, self._n_iters):
+        for epoch in tqdm(range(iter_start, self._n_iters)):
             # current state
             self._trainer_state["current_iter"] = epoch
 
